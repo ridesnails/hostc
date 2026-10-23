@@ -24,14 +24,14 @@ async function main(): Promise<number> {
 			return 2;
 	}
 
-	const { target, server, qr } = command;
+	const { target, server, qr, name } = command;
 	if (!(await isListening(target))) {
 		console.log(styleText("yellow", `Nothing is listening on ${target.host} yet; requests will fail until it starts.`));
 	}
 
 	let tunnel: Tunnel;
 	try {
-		tunnel = await Tunnel.open({ server, target });
+		tunnel = await Tunnel.open({ server, target, name, adminToken: process.env.HOSTC_ADMIN_TOKEN });
 	} catch (error) {
 		console.error(`${styleText("red", "error")} ${describe(error)}`);
 		return 1;

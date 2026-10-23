@@ -38,6 +38,26 @@ describe("createTunnel", () => {
 		expect(request).toEqual({ method: "POST", path: "/api/tunnels", protocol: String(PROTOCOL_VERSION) });
 	});
 
+	it("claims a fixed name with the admin token (fork extension)", async () => {
+		let request: { authorization?: string; body?: string } = {};
+		await withServer(
+			(req, res) => {
+				let body = "";
+				req.on("data", (chunk) => {
+					body += chunk;
+				});
+				req.on("end", () => {
+					request = { authorization: req.headers.authorization, body };
+					res.writeHead(201, { "content-type": "application/json" });
+					res.end(JSON.stringify({ ...tunnel, id: "magpie", url: "https://magpie.tunnel.test" }));
+				});
+			},
+			async (url) => expect((await createTunnel(url, { name: "magpie", adminToken: "tok" })).id).toBe("magpie"),
+		);
+		expect(request.authorization).toBe("Bearer tok");
+		expect(JSON.parse(request.body ?? "")).toEqual({ name: "magpie" });
+	});
+
 	it.each([
 		[426, "upgrade_required"],
 		[429, "rate_limited"],

@@ -29,13 +29,30 @@ export const PROTOCOL_HEADERS = { [PROTOCOL_HEADER]: String(PROTOCOL_VERSION) };
 
 const CREATE_TIMEOUT_MS = 15_000;
 
-export async function createTunnel(server: string): Promise<CreateTunnelResponse> {
+export type CreateTunnelOptions = {
+	/** Fork extension: claim this fixed tunnel name instead of a random id. */
+	name?: string;
+	/** Bearer token authorizing the name claim (the server's NAMED_TUNNEL_TOKEN). */
+	adminToken?: string;
+};
+
+export async function createTunnel(server: string, options?: CreateTunnelOptions): Promise<CreateTunnelResponse> {
 	// The deadline covers both response headers and the complete JSON body.
 	const signal = AbortSignal.timeout(CREATE_TIMEOUT_MS);
+	const headers: Record<string, string> = { ...PROTOCOL_HEADERS };
+	let requestBody: string | undefined;
+	if (options?.name) {
+		headers["content-type"] = "application/json";
+		if (options.adminToken) {
+			headers.authorization = `Bearer ${options.adminToken}`;
+		}
+		requestBody = JSON.stringify({ name: options.name });
+	}
 	try {
 		const response = await fetch(new URL(API_TUNNELS_PATH, server), {
 			method: "POST",
-			headers: PROTOCOL_HEADERS,
+			headers,
+			body: requestBody,
 			signal,
 		});
 		if (response.status !== 201) {
