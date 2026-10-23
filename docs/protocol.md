@@ -30,6 +30,19 @@ The token is `HMAC-SHA256(TOKEN_SECRET, "connect:<id>")`, sent as `Authorization
 It never expires on its own; it stops working when the tunnel expires. The client keeps it in memory
 only, so restarting the CLI creates a new tunnel.
 
+### Named tunnels (fork extension, not upstream)
+
+`POST /api/tunnels` may carry a JSON body `{ "name": "<name>" }` plus
+`Authorization: Bearer <NAMED_TUNNEL_TOKEN>` to claim a fixed name instead of a random id:
+the tunnel's URL becomes `https://<name>.<TUNNEL_DOMAIN>` and stays stable across restarts.
+A name is 3-32 chars of lowercase letters, digits and hyphens (start/end alphanumeric) and
+never satisfies `isTunnelId`, so names and random ids share one label space without
+colliding. Without the token the claim returns `401`; an invalid name returns `400`.
+Reclaiming a name whose tunnel is still connected replaces the old connection (`4001`),
+exactly like re-creating a random tunnel. This extension is wire-compatible: clients that
+send no body and servers that ignore it behave exactly as before, so `PROTOCOL_VERSION`
+is unchanged.
+
 ## Tunnel lifetime
 
 | Event                                 | Effect                                                |
