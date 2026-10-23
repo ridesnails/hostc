@@ -1,4 +1,5 @@
 import {
+	type CreateTunnelResponse,
 	CLOSE_PROTOCOL_ERROR,
 	CLOSE_REPLACED,
 	CLOSE_SHUTDOWN,
@@ -470,5 +471,50 @@ describe("connection lifecycle", () => {
 		await client.waitUntil(() => client.texts.includes(PONG));
 		expect(await runDurableObjectAlarm(env.TUNNEL.getByName(tunnel.id))).toBe(true);
 		expect(client.closed).toBeNull();
+	});
+});
+
+describe("named tunnels (fork extension)", () => {
+	const ADMIN = { authorization: "Bearer test-named-tunnel-token" };
+	let namedClients = 0;
+
+	async function createNamed(name: string, headers: Record<string, string> = {}): Promise<Response> {
+		namedClients += 1;
+		return SELF.fetch(`${API}/api/tunnels`, {
+			method: "POST",
+			headers: {
+				...PROTOCOL,
+				"cf-connecting-ip": `198.51.100.${namedClients}`,
+				"content-type": "application/json",
+				...headers,
+			},
+			body: JSON.stringify({ name }),
+		});
+	}
+
+	it("rejects a name claim without the named-tunnel token", async () => {
+		expect((await createNamed("magpie")).status).toBe(401);
+		expect((await createNamed("magpie", { authorization: "Bearer wrong" })).status).toBe(401);
+	});
+
+	it("rejects an invalid name even with the token", async () => {
+		expect((await createNamed("Bad_Name!", ADMIN)).status).toBe(400);
+		// A random-id-shaped string is not a claimable name.
+		expect((await createNamed("abcdefghijk2", ADMIN)).status).toBe(400);
+	});
+
+	it("creates a named tunnel and connects to it by name", async () => {
+		const response = await createNamed("magpie", ADMIN);
+		expect(response.status).toBe(201);
+		const tunnel = (await response.json()) as CreateTunnelResponse;
+		expect(tunnel.id).toBe("magpie");
+		expect(tunnel.url).toBe("https://magpie.tunnel.test");
+		expect(tunnel.connectUrl).toBe("wss://api.test/api/tunnels/magpie/connect");
+		const client = await connect(tunnel);
+		client.ws.close();
+	});
+
+	it("lets the owner reclaim the same name", async () => {
+		expect((await createNamed("magpie", ADMIN)).status).toBe(201);
 	});
 });

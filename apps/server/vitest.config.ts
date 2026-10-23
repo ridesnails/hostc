@@ -13,6 +13,7 @@ export default defineConfig({
 				bindings: {
 					TUNNEL_DOMAIN: "tunnel.test",
 					TOKEN_SECRET: "test-secret-that-is-at-least-32-bytes-long",
+					NAMED_TUNNEL_TOKEN: "test-named-tunnel-token",
 				},
 			},
 		}),

@@ -26,6 +26,8 @@ export default defineConfig(({ mode }) => {
 			env: {
 				TUNNEL_DOMAIN: bindings.text(tunnelDomain),
 				TOKEN_SECRET: bindings.secret(),
+				// Fork extension: authorizes claiming fixed tunnel names (see packages/protocol).
+				NAMED_TUNNEL_TOKEN: bindings.secret(),
 				TUNNEL: bindings.durableObject({ worker, exportName: "Tunnel" }),
 				CREATE_LIMIT: bindings.rateLimit({
 					namespace: "1001",

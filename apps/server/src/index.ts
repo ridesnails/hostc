@@ -1,7 +1,9 @@
 import {
 	API_TUNNELS_PATH,
+	type CreateTunnelRequest,
 	type CreateTunnelResponse,
-	isTunnelId,
+	isTunnelLabel,
+	isTunnelName,
 	PROTOCOL_HEADER,
 	PROTOCOL_VERSION,
 	TUNNEL_ID_ALPHABET,
@@ -55,7 +57,7 @@ export function tunnelIdFromHost(host: string, tunnelDomain: string): string | n
 		return undefined;
 	}
 	const label = normalized.slice(0, -suffix.length);
-	return isTunnelId(label) ? label : null;
+	return isTunnelLabel(label) ? label : null;
 }
 
 function handleTunnelRequest(request: Request, env: Env, tunnelId: string | null): Promise<Response> | Response {
@@ -72,7 +74,25 @@ async function createTunnel(request: Request, env: Env, url: URL): Promise<Respo
 		return jsonError(429, "Too many tunnels created. Try again in a minute.");
 	}
 
-	const id = randomTunnelId();
+	// Fork extension: an optional JSON body { name } claims a fixed tunnel name.
+	// Random tunnels (no body) stay anonymous; a name is only handed out to a
+	// caller presenting the NAMED_TUNNEL_TOKEN secret, so names cannot be squatted.
+	let id: string;
+	const requested = await readRequestedName(request);
+	if (requested instanceof Response) {
+		return requested;
+	}
+	if (requested !== undefined) {
+		if (!isTunnelName(requested)) {
+			return jsonError(400, `Invalid tunnel name "${requested}". Use 3-32 lowercase letters, digits or hyphens.`);
+		}
+		if (!(await isNamedTunnelAdmin(request, env))) {
+			return jsonError(401, "Claiming a tunnel name requires the named-tunnel token.");
+		}
+		id = requested;
+	} else {
+		id = randomTunnelId();
+	}
 	await env.TUNNEL.getByName(id).init();
 
 	const connectUrl = new URL(`${API_TUNNELS_PATH}/${id}/connect`, url);
@@ -87,7 +107,7 @@ async function createTunnel(request: Request, env: Env, url: URL): Promise<Respo
 }
 
 async function connectTunnel(request: Request, env: Env, id: string): Promise<Response> {
-	if (!isTunnelId(id)) {
+	if (!isTunnelLabel(id)) {
 		return jsonError(404, "Tunnel not found");
 	}
 	if (request.headers.get("upgrade")?.toLowerCase() !== "websocket") {
@@ -105,6 +125,56 @@ function checkProtocol(request: Request): Response | null {
 		return null;
 	}
 	return jsonError(426, "This hostc version is not supported by the server. Run `npx hostc@latest` to upgrade.");
+}
+
+/**
+ * The optional `name` from a create request's JSON body.
+ * Returns undefined for an anonymous (random) tunnel, or an error Response.
+ */
+async function readRequestedName(request: Request): Promise<string | undefined | Response> {
+	const text = await request.text();
+	if (!text) {
+		return undefined;
+	}
+	let body: unknown;
+	try {
+		body = JSON.parse(text);
+	} catch {
+		return jsonError(400, "Create request body must be JSON.");
+	}
+	const name = (body as CreateTunnelRequest | null)?.name;
+	if (name === undefined) {
+		return undefined;
+	}
+	if (typeof name !== "string") {
+		return jsonError(400, "Tunnel name must be a string.");
+	}
+	return name;
+}
+
+/** Named tunnels are authorized by `Authorization: Bearer <NAMED_TUNNEL_TOKEN>`. */
+async function isNamedTunnelAdmin(request: Request, env: Env): Promise<boolean> {
+	const secret = (env as { NAMED_TUNNEL_TOKEN?: string }).NAMED_TUNNEL_TOKEN;
+	if (!secret) {
+		return false;
+	}
+	const token = request.headers.get("authorization")?.match(/^Bearer (\S+)$/)?.[1];
+	if (!token) {
+		return false;
+	}
+	// Compare SHA-256 digests so the comparison time does not leak the secret.
+	const encoder = new TextEncoder();
+	const [given, expected] = await Promise.all([
+		crypto.subtle.digest("SHA-256", encoder.encode(token)),
+		crypto.subtle.digest("SHA-256", encoder.encode(secret)),
+	]);
+	const a = new Uint8Array(given);
+	const b = new Uint8Array(expected);
+	let diff = 0;
+	for (let i = 0; i < a.length; i++) {
+		diff |= (a[i] ?? 0) ^ (b[i] ?? 0);
+	}
+	return diff === 0;
 }
 
 function randomTunnelId(): string {
