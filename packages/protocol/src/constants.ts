@@ -67,6 +67,32 @@ export function isTunnelId(value: string): boolean {
 	return true;
 }
 
+/**
+ * Fork extension (ridesnails/hostc, not upstream): a tunnel may claim a fixed name
+ * instead of a random id, so its public URL stays stable across restarts.
+ *
+ * A name is 3-32 chars of lowercase letters, digits and hyphens, starting and ending
+ * with a letter or digit. A name never collides with a random id: anything that
+ * `isTunnelId` accepts is not a name. Claiming a name requires the server's
+ * NAMED_TUNNEL_TOKEN; random tunnels stay anonymous as before.
+ */
+export function isTunnelName(value: string): boolean {
+	if (value.length < 3 || value.length > 32 || isTunnelId(value)) {
+		return false;
+	}
+	return /^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$/.test(value);
+}
+
+/** What may appear as the `<label>` in `<label>.<TUNNEL_DOMAIN>`: a random id or a claimed name. */
+export function isTunnelLabel(value: string): boolean {
+	return isTunnelId(value) || isTunnelName(value);
+}
+
+/** Request body of `POST /api/tunnels`. Empty for a random tunnel; `name` claims a fixed name. */
+export type CreateTunnelRequest = {
+	name?: string;
+};
+
 /** Response body of `POST /api/tunnels`. */
 export type CreateTunnelResponse = {
 	id: string;
