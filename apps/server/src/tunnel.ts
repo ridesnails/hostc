@@ -46,6 +46,19 @@ const STREAM_CEILING_KEY = "streamCeiling";
 const STREAM_ID_BLOCK = 1024;
 
 /**
+ * A stream moves at most one window per round trip, so 256 KiB caps it at about 1 MB/s over a
+ * 250 ms path. A response stream's window doubles, up to this size, while that limits it (see
+ * growWindow). Clients accept any WINDOW grant, so this needs no protocol change.
+ */
+const MAX_STREAM_WINDOW_BYTES = 4 * 1024 * 1024;
+/** Windows that take longer than this to reach the visitor are slow streams; they never grow. */
+const WINDOW_GROWTH_MS = 1000;
+/** Allowance for clock steps and jitter when comparing how long windows took. */
+const WINDOW_JITTER_MS = 5;
+/** Window beyond STREAM_WINDOW_BYTES, shared by all streams of a tunnel. Bounds the extra memory. */
+export const WINDOW_BUDGET_BYTES = 16 * 1024 * 1024;
+
+/**
  * Everything needed to route WebSocket traffic lives in socket attachments and
  * tags, so the object can hibernate while a tunnel or a public WebSocket is idle.
  */
@@ -66,6 +79,13 @@ type HttpStream = {
 	uploading: boolean;
 	/** Response body bytes the client may still send to us. */
 	receiveCredit: number;
+	/** Response window granted to the client: STREAM_WINDOW_BYTES, grown while the stream is fast. */
+	window: number;
+	/** Start of the current window (0 until the first full window) and its bytes that reached the visitor. */
+	windowStartedAt: number;
+	windowBytes: number;
+	/** Shortest time a full window has taken to reach the visitor: about one round trip. 0 until measured. */
+	fastestWindowMs: number;
 	queue: Uint8Array[];
 	pulling: boolean;
 	ended: boolean;
@@ -87,6 +107,7 @@ export class Tunnel extends DurableObject<Env> {
 	private streamCeiling = 0;
 	private readonly http = new Map<number, HttpStream>();
 	private readonly pendingWebSockets = new Map<number, PendingWebSocket>();
+	private windowBudget = WINDOW_BUDGET_BYTES;
 
 	constructor(ctx: DurableObjectState, env: Env) {
 		super(ctx, env);
@@ -400,6 +421,10 @@ export class Tunnel extends DurableObject<Env> {
 			wakeUploader: null,
 			uploading: request.body !== null,
 			receiveCredit: STREAM_WINDOW_BYTES,
+			window: STREAM_WINDOW_BYTES,
+			windowStartedAt: 0,
+			windowBytes: 0,
+			fastestWindowMs: 0,
 			queue: [],
 			pulling: false,
 			ended: false,
@@ -520,13 +545,49 @@ export class Tunnel extends DurableObject<Env> {
 			const chunk = stream.queue.shift() as Uint8Array;
 			stream.pulling = false;
 			controller.enqueue(chunk);
-			stream.receiveCredit += chunk.byteLength;
-			this.sendFrame(FrameType.Window, stream.id, encodeWindow(chunk.byteLength));
+			const grant = chunk.byteLength + this.growWindow(stream, chunk.byteLength);
+			stream.receiveCredit += grant;
+			this.sendFrame(FrameType.Window, stream.id, encodeWindow(grant));
 		}
 		if (stream.ended && stream.queue.length === 0) {
 			controller.close();
 			this.finish(stream);
 		}
+	}
+
+	/**
+	 * Counts bytes handed to the visitor and, after each full window, decides whether the window held
+	 * the stream back. While it does, a window takes one round trip whatever its size, so a doubled
+	 * window takes no longer than the fastest one. Once the link is the limit, a doubled window takes
+	 * twice as long and growing further would only queue data ahead of other streams. Nothing queued
+	 * means the visitor keeps up. Returns the bytes to grant on top.
+	 */
+	private growWindow(stream: HttpStream, bytes: number): number {
+		stream.windowBytes += bytes;
+		if (stream.windowBytes < stream.window) {
+			return 0;
+		}
+		const now = Date.now();
+		const elapsed = now - stream.windowStartedAt;
+		const timed = stream.windowStartedAt > 0;
+		stream.windowStartedAt = now;
+		stream.windowBytes = 0;
+		if (!timed) {
+			// The first window went out before any grant, so how fast it arrived says nothing about the round trip.
+			return 0;
+		}
+		stream.fastestWindowMs = stream.fastestWindowMs === 0 ? elapsed : Math.min(stream.fastestWindowMs, elapsed);
+		const limitedByWindow =
+			elapsed < WINDOW_GROWTH_MS &&
+			elapsed <= stream.fastestWindowMs * 1.5 + WINDOW_JITTER_MS &&
+			stream.queue.length === 0;
+		if (!limitedByWindow) {
+			return 0;
+		}
+		const extra = Math.min(stream.window, MAX_STREAM_WINDOW_BYTES - stream.window, this.windowBudget);
+		stream.window += extra;
+		this.windowBudget -= extra;
+		return extra;
 	}
 
 	/** Normal completion of the response. */
@@ -568,6 +629,7 @@ export class Tunnel extends DurableObject<Env> {
 		stream.done = true;
 		stream.queue = [];
 		this.http.delete(stream.id);
+		this.windowBudget += stream.window - STREAM_WINDOW_BYTES;
 		stream.wakeUploader?.();
 	}
 

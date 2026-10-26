@@ -19,6 +19,7 @@ import {
 import { env, evictDurableObject, runDurableObjectAlarm, runInDurableObject, SELF } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 
+import { WINDOW_BUDGET_BYTES } from "../src/tunnel.ts";
 import { API, connect, createTunnel, PROTOCOL, publicUrl, readAll } from "./helpers.ts";
 
 function createFromSameClient(): Promise<Response> {
@@ -153,6 +154,77 @@ describe("public HTTP", () => {
 
 		client.head(open.stream, { status: 204, body: false });
 		expect((await pending).status).toBe(204);
+	});
+
+	it("grows the window of a fast response and gives it back when the response ends", async () => {
+		const tunnel = await createTunnel();
+		const client = await connect(tunnel);
+		const pending = SELF.fetch(publicUrl(tunnel));
+		const open = await client.next((frame) => frame.type === FrameType.Open);
+		client.head(open.stream);
+		const body = readAll(await pending);
+
+		// Like the real client: send while there is credit, otherwise wait for a grant.
+		const chunk = new Uint8Array(MAX_CHUNK_BYTES).fill(3);
+		const total = 4 * 1024 * 1024;
+		let credit = STREAM_WINDOW_BYTES;
+		let largestGrant = 0;
+		for (let sent = 0; sent < total; sent += chunk.byteLength) {
+			while (credit < chunk.byteLength) {
+				const grant = await client.next((frame) => frame.type === FrameType.Window);
+				const bytes = decodeWindow(grant.payload);
+				credit += bytes;
+				largestGrant = Math.max(largestGrant, bytes);
+			}
+			client.send(FrameType.Data, open.stream, chunk);
+			credit -= chunk.byteLength;
+		}
+		client.send(FrameType.End, open.stream);
+		expect((await body).byteLength).toBe(total);
+		expect(largestGrant).toBeGreaterThan(MAX_CHUNK_BYTES);
+		expect(client.closed).toBeNull();
+
+		const budget = await runInDurableObject(env.TUNNEL.getByName(tunnel.id), (instance) =>
+			Reflect.get(instance, "windowBudget"),
+		);
+		expect(budget).toBe(WINDOW_BUDGET_BYTES);
+	});
+
+	it("stops widening a window once the link, not the window, is the limit", async () => {
+		const tunnel = await createTunnel();
+		const client = await connect(tunnel);
+		const pending = SELF.fetch(publicUrl(tunnel));
+		const open = await client.next((frame) => frame.type === FrameType.Open);
+		client.head(open.stream);
+		const body = readAll(await pending);
+
+		// A link that carries a chunk every 20 ms: a window of 256 KiB takes 80 ms, and a wider one
+		// only takes longer and queues data ahead of other streams.
+		const chunk = new Uint8Array(MAX_CHUNK_BYTES).fill(5);
+		const chunks = 40;
+		for (let index = 0; index < chunks; index += 1) {
+			await new Promise((resolve) => setTimeout(resolve, 20));
+			client.send(FrameType.Data, open.stream, chunk);
+		}
+		const window = await runInDurableObject(env.TUNNEL.getByName(tunnel.id), (instance) => {
+			const streams = Reflect.get(instance, "http") as Map<number, { window: number }>;
+			return streams.get(open.stream)?.window;
+		});
+		client.send(FrameType.End, open.stream);
+		expect((await body).byteLength).toBe(chunks * MAX_CHUNK_BYTES);
+		expect(window).toBeLessThanOrEqual(2 * STREAM_WINDOW_BYTES);
+	});
+
+	it("resets the local request when the visitor goes away", async () => {
+		const tunnel = await createTunnel();
+		const client = await connect(tunnel);
+		const visitor = new AbortController();
+		const pending = SELF.fetch(publicUrl(tunnel, "/slow"), { signal: visitor.signal });
+		const open = await client.next((frame) => frame.type === FrameType.Open);
+		visitor.abort();
+		await expect(pending).rejects.toThrow();
+		const reset = await client.next((frame) => frame.type === FrameType.Reset && frame.stream === open.stream);
+		expect(decodeText(reset.payload)).toBe("public client went away");
 	});
 
 	it("turns a client reset into a 502 without dropping the connection", async () => {

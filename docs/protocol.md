@@ -84,7 +84,7 @@ reliable, so there are no sequence numbers.
 | 2    | `HEAD`   | client → server | JSON `{ status, headers, body, protocol? }`            |
 | 3    | `DATA`   | both            | HTTP body chunk (≤ 64 KiB) or binary WebSocket message |
 | 4    | `TEXT`   | both            | text WebSocket message (UTF-8)                         |
-| 5    | `END`    | both            | HTTP: empty. WebSocket: `u16 code                      | UTF-8 reason` |
+| 5    | `END`    | both            | HTTP: empty. WebSocket: `u16 code \| UTF-8 reason`     |
 | 6    | `RESET`  | both            | UTF-8 reason; aborts the stream in both directions     |
 | 7    | `WINDOW` | both            | `u32` bytes granted                                    |
 
@@ -106,14 +106,22 @@ reliable, so there are no sequence numbers.
 ## Flow control
 
 Only HTTP bodies are flow controlled, because only there can one side be slower than the other for
-long. Each stream has a 256 KiB window per direction. A sender may have at most the granted bytes in
-flight; the receiver grants them back with `WINDOW` once the next hop has accepted them (the public
-response stream pulled the chunk, or the local socket flushed it).
+long. Each stream starts with a 256 KiB window per direction. A sender may have at most the granted
+bytes in flight; the receiver grants them back with `WINDOW` once the next hop has accepted them (the
+public response stream pulled the chunk, or the local socket flushed it).
+
+A receiver may grant more than it got back, which widens the window. A stream moves at most one
+window per round trip, so the server widens response streams that are held back by their window.
+After each full window that reached the visitor with nothing left queued, it doubles the window if
+that window took no longer than the fastest so far (plus half): a window that limits the stream
+takes one round trip whatever its size, while one wider than the link needs takes longer and only
+queues data ahead of other streams. Windows grow up to 4 MiB per stream and 16 MiB in total per
+tunnel; streams that take over a second per window keep 256 KiB.
 
 WebSocket messages are forwarded whole (up to 1 MiB, larger ones close the socket with `1009`) and
 without windows.
 
-Memory on the server is bounded by `256 streams × 256 KiB`.
+Memory on the server is bounded by `256 streams × 256 KiB` plus the 16 MiB of wider windows.
 
 ## Requests as the local server sees them
 
