@@ -28,7 +28,7 @@ and the apex `hostc.app` redirects to `hostc.dev`.
 | Build command     | `pnpm install --frozen-lockfile`                                                          | `pnpm install --frozen-lockfile`                                |
 | Deploy command    | `pnpm run deploy`                                                                         | `pnpm run deploy`                                               |
 | Build variables   | `NODE_VERSION=22` `PNPM_VERSION=12.15.0` `API_DOMAIN=hostc.dev` `TUNNEL_DOMAIN=hostc.app` | `NODE_VERSION=22` `PNPM_VERSION=12.15.0` `WEB_DOMAIN=hostc.dev` |
-| Build watch paths | `apps/server/*`, `packages/protocol/*`, `pnpm-lock.yaml`                                  | `apps/web/*`, `pnpm-lock.yaml`                                  |
+| Build watch paths | `apps/server/*`, `packages/protocol/*`, `pnpm-lock.yaml`                                  | `apps/web/*`, `apps/cli/CHANGELOG.md`, `pnpm-lock.yaml`         |
 
 Workers Builds defaults to an older pnpm and does not read `packageManager`, hence `PNPM_VERSION`.
 `NODE_VERSION=22` builds on the Node.js major that CI tests; the image's default Node.js can be older
@@ -58,6 +58,22 @@ workflow `release.yml`. No npm token is stored in GitHub.
   `pnpm -F @hostc/server exec wrangler rollback --name hostc-tunnel`.
 - **CLI**: bump `version` in `apps/cli/package.json` (and `CHANGELOG.md`), merge, then run
   "Release CLI" with dist-tag `latest`.
+  The workflow packs the CLI, installs that tarball in an empty directory, runs the end-to-end
+  tests against it and publishes the same file.
+
+## Errors in production
+
+The tunnel server counts each request it could not serve in the Analytics Engine dataset
+`hostc_errors`: the error's title and nothing else, so no URL, address or tunnel. To see the last
+week:
+
+```sh
+pnpm -F @hostc/server exec cf analytics-engine sql query --body "SELECT blob1 AS error,
+  SUM(_sample_interval) AS count FROM hostc_errors WHERE timestamp > NOW() - INTERVAL '7' DAY
+  GROUP BY error ORDER BY count DESC FORMAT JSON"
+```
+
+`Tunnel offline`, `Tunnel busy` come from hostc; `Local server …` mean a user's own server failed.
 
 ## Protocol changes
 
@@ -73,7 +89,8 @@ upgrade prompt.
 - `hostc.dev` and `hostc.app` use DNS-only CNAMEs to preferred Cloudflare hosts, which route
   mainland China (most users) better than the default addresses: `hostc.dev` and `hostc.app` →
   `akazwz.cf.090227.xyz`, `*.hostc.app` → `store.ubi.com`. Cloudflare still applies each zone's
-  Worker routes and rules, which match by Host. Self-hosters use proxied records instead (README).
+  Worker routes and rules, which match by Host. Self-hosters use proxied records instead
+  ([self-hosting.md](./self-hosting.md)).
 - A Redirect Rule on `hostc.app` sends the apex to `https://hostc.dev` (301).
 - `hostc.app` publishes `v=spf1 -all` and a `p=reject` DMARC record: it never sends mail, and a
   tunnel domain is an obvious target for spoofing.

@@ -31,6 +31,7 @@ export default defineConfig(({ mode }) => {
 				// Fork extension: authorizes claiming fixed tunnel names (see packages/protocol).
 				NAMED_TUNNEL_TOKEN: bindings.secret(),
 				TUNNEL: bindings.durableObject({ worker, exportName: "Tunnel" }),
+				ERRORS: bindings.analyticsEngineDataset({ name: "hostc_errors" }),
 				CREATE_LIMIT: bindings.rateLimit({
 					namespace: "1001",
 					simple: { limit: 20, period: 60 },

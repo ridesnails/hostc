@@ -22,7 +22,14 @@ hostc <target> [options]
   https://localhost:5173   any http(s) origin
 
   --server <url>   tunnel server (env HOSTC_SERVER)
+  --name <name>    claim a fixed tunnel name, e.g. --name magpie gives
+                   https://magpie.<tunnel-domain> (env HOSTC_NAME);
+                   needs env HOSTC_ADMIN_TOKEN with the server's named-tunnel token
   --qr             print a QR code of the public URL
+  --here           hostc codex: show only this directory (commands still reach
+                   the whole machine)
+  -h, --help       show this help
+  -v, --version    show the version
 ```
 
 Anyone with the URL can reach your local server, so don't expose anything sensitive.
@@ -35,7 +42,7 @@ hostc is free and moves fast: server updates can break older CLIs. Always use `n
 rather than installing it globally or as a dependency, which would pin an old version; an outdated
 version stops at startup and tells you to upgrade.
 
-Docs: https://hostc.dev · Requires Node.js 22+.
+Docs: https://hostc.dev · Requires Node.js 22.1+.
 
 hostc is free and open source. If it helps you, a star on https://github.com/akazwz/hostc helps
 others find it and encourages the project.

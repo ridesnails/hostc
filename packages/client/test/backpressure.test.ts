@@ -1,7 +1,15 @@
 import { once } from "node:events";
 import type { AddressInfo } from "node:net";
 
-import { decodeClose, decodeFrame, encodeFrame, encodeOpen, type Frame, FrameType } from "@hostc/protocol";
+import {
+	decodeClose,
+	decodeFrame,
+	encodeFrame,
+	encodeOpen,
+	type Frame,
+	FrameType,
+	WindowBudget,
+} from "@hostc/protocol";
 import { afterEach, describe, expect, it } from "vitest";
 import { type RawData, WebSocket, WebSocketServer } from "ws";
 
@@ -130,6 +138,7 @@ describe("WebSocket backpressure", () => {
 				},
 				log: () => {},
 				remove: () => {},
+				windowBudget: new WindowBudget(),
 			},
 			STREAM,
 			{ method: "GET", path: "/", headers: [], body: false, websocket: [] },

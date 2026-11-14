@@ -1,0 +1,18 @@
+/* The few rules about the document itself. Everything else is StyleX, which also appends the
+   rules it generates to this file: keep it imported from src/App.tsx. */
+
+:root {
+	color-scheme: light dark;
+	-webkit-font-smoothing: antialiased;
+	-webkit-text-size-adjust: 100%;
+}
+
+*,
+*::before,
+*::after {
+	box-sizing: border-box;
+}
+
+body {
+	margin: 0;
+}

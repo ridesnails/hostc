@@ -16,6 +16,7 @@ import {
 	encodeWindow,
 	type Frame,
 	FrameType,
+	GrowingWindow,
 	type HeaderList,
 	type HeadMessage,
 	MAX_CHUNK_BYTES,
@@ -32,6 +33,7 @@ import {
 	STREAM_WINDOW_BYTES,
 	stripHopByHop,
 	stripWebSocketHandshake,
+	WindowBudget,
 } from "@hostc/protocol";
 import { DurableObject } from "cloudflare:workers";
 
@@ -46,17 +48,11 @@ const STREAM_CEILING_KEY = "streamCeiling";
 const STREAM_ID_BLOCK = 1024;
 
 /**
- * A stream moves at most one window per round trip, so 256 KiB caps it at about 1 MB/s over a
- * 250 ms path. A response stream's window doubles, up to this size, while that limits it (see
- * growWindow). Clients accept any WINDOW grant, so this needs no protocol change.
+ * Requests that may wait for a free stream; beyond this they get 503. Browsers send up to 256
+ * requests at once over one HTTP/2 connection, and a page's own WebSocket (Vite's HMR) or a second
+ * device already takes the tunnel past MAX_STREAMS, which used to fail module loads and the page.
  */
-const MAX_STREAM_WINDOW_BYTES = 4 * 1024 * 1024;
-/** Windows that take longer than this to reach the visitor are slow streams; they never grow. */
-const WINDOW_GROWTH_MS = 1000;
-/** Allowance for clock steps and jitter when comparing how long windows took. */
-const WINDOW_JITTER_MS = 5;
-/** Window beyond STREAM_WINDOW_BYTES, shared by all streams of a tunnel. Bounds the extra memory. */
-export const WINDOW_BUDGET_BYTES = 16 * 1024 * 1024;
+export const MAX_WAITING = 4 * MAX_STREAMS;
 
 /**
  * Everything needed to route WebSocket traffic lives in socket attachments and
@@ -79,13 +75,8 @@ type HttpStream = {
 	uploading: boolean;
 	/** Response body bytes the client may still send to us. */
 	receiveCredit: number;
-	/** Response window granted to the client: STREAM_WINDOW_BYTES, grown while the stream is fast. */
-	window: number;
-	/** Start of the current window (0 until the first full window) and its bytes that reached the visitor. */
-	windowStartedAt: number;
-	windowBytes: number;
-	/** Shortest time a full window has taken to reach the visitor: about one round trip. 0 until measured. */
-	fastestWindowMs: number;
+	/** Response window granted to the client, widened while it holds the response back. */
+	window: GrowingWindow;
 	queue: Uint8Array[];
 	pulling: boolean;
 	ended: boolean;
@@ -107,7 +98,10 @@ export class Tunnel extends DurableObject<Env> {
 	private streamCeiling = 0;
 	private readonly http = new Map<number, HttpStream>();
 	private readonly pendingWebSockets = new Map<number, PendingWebSocket>();
-	private windowBudget = WINDOW_BUDGET_BYTES;
+	/** Requests waiting for a free stream, oldest first. Called with false when they should stop waiting. */
+	private readonly waiting: ((free: boolean) => void)[] = [];
+	/** Response window beyond STREAM_WINDOW_BYTES, shared by the streams of this tunnel. */
+	private readonly windowBudget = new WindowBudget();
 
 	constructor(ctx: DurableObjectState, env: Env) {
 		super(ctx, env);
@@ -187,6 +181,7 @@ export class Tunnel extends DurableObject<Env> {
 		const attachment = attachmentOf(ws);
 		if (attachment?.kind === "public") {
 			this.sendFrame(FrameType.End, attachment.stream, encodeClose({ code, reason }));
+			this.wakeWaiting();
 			return;
 		}
 		if (attachment?.kind === "client" && !attachment.retired) {
@@ -264,8 +259,8 @@ export class Tunnel extends DurableObject<Env> {
 			this.fail(stream, pages.offline);
 		}
 		for (const [id, pending] of this.pendingWebSockets) {
-			this.pendingWebSockets.delete(id);
-			pending.settle(new Response("Tunnel offline", { status: 502 }));
+			this.forgetPending(id);
+			pending.settle(this.refuseWebSocket(pages.offline));
 		}
 		for (const ws of this.ctx.getWebSockets("public")) {
 			safeClose(ws, 1001, "tunnel disconnected");
@@ -294,7 +289,7 @@ export class Tunnel extends DurableObject<Env> {
 						this.fail(http, pages.upstreamFailed);
 					}
 					this.pendingWebSockets.get(id)?.settle(new Response("Invalid response from local server", { status: 502 }));
-					this.pendingWebSockets.delete(id);
+					this.forgetPending(id);
 					return;
 				}
 				if (http) {
@@ -340,7 +335,7 @@ export class Tunnel extends DurableObject<Env> {
 				}
 				const pending = this.pendingWebSockets.get(id);
 				if (pending) {
-					this.pendingWebSockets.delete(id);
+					this.forgetPending(id);
 					pending.settle(new Response("Local WebSocket unavailable", { status: 502 }));
 					return;
 				}
@@ -389,7 +384,72 @@ export class Tunnel extends DurableObject<Env> {
 	}
 
 	private streamCount(): number {
-		return this.http.size + this.pendingWebSockets.size + this.ctx.getWebSockets("public").length;
+		// A public socket we are closing no longer carries a stream, and its waiters were already woken.
+		const sockets = this.ctx.getWebSockets("public").filter((ws) => ws.readyState === WebSocket.OPEN);
+		return this.http.size + this.pendingWebSockets.size + sockets.length;
+	}
+
+	/**
+	 * Waits until the tunnel has a free stream. False when too many requests already wait, none frees
+	 * up in time, or the visitor leaves. Bursts of module requests then wait instead of failing a page.
+	 */
+	private async freeStream(signal: AbortSignal): Promise<boolean> {
+		// Requests already waiting go first; this one goes too if a stream is left over.
+		const leftOver = MAX_STREAMS - this.streamCount() - this.waiting.length;
+		this.wakeWaiting();
+		if (leftOver > 0) {
+			return true;
+		}
+		if (this.waiting.length >= MAX_WAITING) {
+			return false;
+		}
+		const deadline = Date.now() + RESPONSE_TIMEOUT_MS;
+		let first = false;
+		for (;;) {
+			const free = await new Promise<boolean>((resolve) => {
+				const timer = setTimeout(() => settle(false), deadline - Date.now());
+				const onAbort = () => settle(false);
+				const settle = (value: boolean) => {
+					clearTimeout(timer);
+					signal.removeEventListener("abort", onAbort);
+					const index = this.waiting.indexOf(settle);
+					if (index >= 0) {
+						this.waiting.splice(index, 1);
+					}
+					resolve(value);
+				};
+				signal.addEventListener("abort", onAbort);
+				// Woken but still full: keep its place at the front.
+				if (first) {
+					this.waiting.unshift(settle);
+				} else {
+					this.waiting.push(settle);
+				}
+			});
+			if (!free) {
+				return false;
+			}
+			if (this.streamCount() < MAX_STREAMS) {
+				return true;
+			}
+			first = true;
+		}
+	}
+
+	/** Lets as many waiting requests go as there are free streams. They check again when they run. */
+	private wakeWaiting(): void {
+		const free = MAX_STREAMS - this.streamCount();
+		if (free > 0 && this.waiting.length > 0) {
+			for (const settle of this.waiting.slice(0, free)) {
+				settle(true);
+			}
+		}
+	}
+
+	private forgetPending(id: number): void {
+		if (this.pendingWebSockets.delete(id)) {
+			this.wakeWaiting();
+		}
 	}
 
 	private async isAlive(): Promise<boolean> {
@@ -402,10 +462,14 @@ export class Tunnel extends DurableObject<Env> {
 
 	private async proxyHttp(request: Request): Promise<Response> {
 		if (!(await this.liveClient())) {
-			return errorResponse(request, pages.offline);
+			return this.refuse(request, pages.offline);
 		}
-		if (this.streamCount() >= MAX_STREAMS) {
-			return errorResponse(request, pages.busy);
+		if (!(await this.freeStream(request.signal))) {
+			return this.refuse(request, pages.busy);
+		}
+		// The client may have gone while the request waited.
+		if (!this.client()) {
+			return this.refuse(request, pages.offline);
 		}
 
 		const id = await this.allocateStream();
@@ -421,10 +485,7 @@ export class Tunnel extends DurableObject<Env> {
 			wakeUploader: null,
 			uploading: request.body !== null,
 			receiveCredit: STREAM_WINDOW_BYTES,
-			window: STREAM_WINDOW_BYTES,
-			windowStartedAt: 0,
-			windowBytes: 0,
-			fastestWindowMs: 0,
+			window: new GrowingWindow(this.windowBudget),
 			queue: [],
 			pulling: false,
 			ended: false,
@@ -452,16 +513,16 @@ export class Tunnel extends DurableObject<Env> {
 		const result = await withTimeout(headResult, RESPONSE_TIMEOUT_MS);
 		if (!result) {
 			this.reset(stream, "response timeout");
-			return errorResponse(request, pages.timeout);
+			return this.refuse(request, pages.timeout);
 		}
 		if (!result.ok) {
-			return errorResponse(request, result.page);
+			return this.refuse(request, result.page);
 		}
 
 		const { head, headers } = result;
 		if (head.status < 200) {
 			this.reset(stream, `unsupported status ${head.status}`);
-			return errorResponse(request, pages.upstreamFailed);
+			return this.refuse(request, pages.upstreamFailed);
 		}
 		if (!head.body || NULL_BODY_STATUSES.has(head.status)) {
 			this.finish(stream);
@@ -545,7 +606,8 @@ export class Tunnel extends DurableObject<Env> {
 			const chunk = stream.queue.shift() as Uint8Array;
 			stream.pulling = false;
 			controller.enqueue(chunk);
-			const grant = chunk.byteLength + this.growWindow(stream, chunk.byteLength);
+			// Nothing left queued: the visitor has taken everything that arrived.
+			const grant = chunk.byteLength + stream.window.delivered(chunk.byteLength, stream.queue.length === 0);
 			stream.receiveCredit += grant;
 			this.sendFrame(FrameType.Window, stream.id, encodeWindow(grant));
 		}
@@ -553,41 +615,6 @@ export class Tunnel extends DurableObject<Env> {
 			controller.close();
 			this.finish(stream);
 		}
-	}
-
-	/**
-	 * Counts bytes handed to the visitor and, after each full window, decides whether the window held
-	 * the stream back. While it does, a window takes one round trip whatever its size, so a doubled
-	 * window takes no longer than the fastest one. Once the link is the limit, a doubled window takes
-	 * twice as long and growing further would only queue data ahead of other streams. Nothing queued
-	 * means the visitor keeps up. Returns the bytes to grant on top.
-	 */
-	private growWindow(stream: HttpStream, bytes: number): number {
-		stream.windowBytes += bytes;
-		if (stream.windowBytes < stream.window) {
-			return 0;
-		}
-		const now = Date.now();
-		const elapsed = now - stream.windowStartedAt;
-		const timed = stream.windowStartedAt > 0;
-		stream.windowStartedAt = now;
-		stream.windowBytes = 0;
-		if (!timed) {
-			// The first window went out before any grant, so how fast it arrived says nothing about the round trip.
-			return 0;
-		}
-		stream.fastestWindowMs = stream.fastestWindowMs === 0 ? elapsed : Math.min(stream.fastestWindowMs, elapsed);
-		const limitedByWindow =
-			elapsed < WINDOW_GROWTH_MS &&
-			elapsed <= stream.fastestWindowMs * 1.5 + WINDOW_JITTER_MS &&
-			stream.queue.length === 0;
-		if (!limitedByWindow) {
-			return 0;
-		}
-		const extra = Math.min(stream.window, MAX_STREAM_WINDOW_BYTES - stream.window, this.windowBudget);
-		stream.window += extra;
-		this.windowBudget -= extra;
-		return extra;
 	}
 
 	/** Normal completion of the response. */
@@ -612,9 +639,29 @@ export class Tunnel extends DurableObject<Env> {
 	}
 
 	/** Aborts a stream without telling the client (it reset it, or it is gone). */
+	/** Answers a request hostc could not serve. */
+	private refuse(request: Request, page: PageOptions): Response {
+		this.countError(page);
+		return errorResponse(request, page);
+	}
+
+	private refuseWebSocket(page: PageOptions): Response {
+		this.countError(page);
+		return new Response(page.title, { status: page.status });
+	}
+
+	/** Without this, nobody learns that visitors get errors. Only the kind is kept: no URL, address or tunnel. */
+	private countError(page: PageOptions): void {
+		this.env.ERRORS.writeDataPoint({ blobs: [page.title], indexes: [page.title] });
+	}
+
 	private fail(stream: HttpStream, page: PageOptions): void {
 		if (stream.done) {
 			return;
+		}
+		// Before the head, the response to the request counts it.
+		if (stream.headReceived) {
+			this.countError(page);
 		}
 		stream.settleHead({ ok: false, page });
 		try {
@@ -629,8 +676,9 @@ export class Tunnel extends DurableObject<Env> {
 		stream.done = true;
 		stream.queue = [];
 		this.http.delete(stream.id);
-		this.windowBudget += stream.window - STREAM_WINDOW_BYTES;
+		stream.window.release();
 		stream.wakeUploader?.();
+		this.wakeWaiting();
 	}
 
 	// ---------------------------------------------------------------------------
@@ -638,10 +686,13 @@ export class Tunnel extends DurableObject<Env> {
 
 	private async proxyWebSocket(request: Request): Promise<Response> {
 		if (!(await this.liveClient())) {
-			return new Response("Tunnel offline", { status: 502 });
+			return this.refuseWebSocket(pages.offline);
 		}
-		if (this.streamCount() >= MAX_STREAMS) {
-			return new Response("Tunnel busy", { status: 503 });
+		if (!(await this.freeStream(request.signal))) {
+			return this.refuseWebSocket(pages.busy);
+		}
+		if (!this.client()) {
+			return this.refuseWebSocket(pages.offline);
 		}
 
 		const offered = parseSubprotocols(request.headers.get("sec-websocket-protocol"));
@@ -670,9 +721,9 @@ export class Tunnel extends DurableObject<Env> {
 		if (response) {
 			return response;
 		}
-		this.pendingWebSockets.delete(id);
+		this.forgetPending(id);
 		this.sendFrame(FrameType.Reset, id, encodeText("response timeout"));
-		return new Response("Local server timed out", { status: 504 });
+		return this.refuseWebSocket(pages.timeout);
 	}
 
 	/**
@@ -684,7 +735,8 @@ export class Tunnel extends DurableObject<Env> {
 		if (!pending) {
 			return;
 		}
-		this.pendingWebSockets.delete(id);
+		// Becomes a public socket, or frees its stream.
+		this.forgetPending(id);
 
 		if (head.status !== 101) {
 			const status = head.status >= 200 && !NULL_BODY_STATUSES.has(head.status) ? head.status : 502;

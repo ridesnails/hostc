@@ -10,6 +10,7 @@ import {
 	encodeWindow,
 	type Frame,
 	FrameType,
+	GrowingWindow,
 	type HeaderList,
 	MAX_CHUNK_BYTES,
 	MAX_WEBSOCKET_MESSAGE_BYTES,
@@ -21,6 +22,7 @@ import {
 	STREAM_WINDOW_BYTES,
 	stripHopByHop,
 	stripWebSocketHandshake,
+	type WindowBudget,
 } from "@hostc/protocol";
 import { type RawData, WebSocket } from "ws";
 
@@ -44,6 +46,8 @@ export type StreamContext = {
 	log: (entry: RequestLog) => void;
 	/** Forgets a stream that has ended. */
 	remove: (stream: number) => void;
+	/** Extra request body window, shared by the streams of the connection. */
+	windowBudget: WindowBudget;
 };
 
 /**
@@ -74,6 +78,8 @@ class HttpStream implements Stream {
 	private response: http.IncomingMessage | null = null;
 	private sendCredit = STREAM_WINDOW_BYTES;
 	private wakeSender: (() => void) | null = null;
+	/** Request body window granted to the server, widened while it holds the upload back. */
+	private readonly window: GrowingWindow;
 	private requestEnded = false;
 	private finished = false;
 
@@ -81,6 +87,7 @@ class HttpStream implements Stream {
 		this.context = context;
 		this.id = id;
 		this.open = open;
+		this.window = new GrowingWindow(context.windowBudget);
 	}
 
 	start(): void {
@@ -113,11 +120,13 @@ class HttpStream implements Stream {
 	receive(frame: Frame): void {
 		switch (frame.type) {
 			case FrameType.Data: {
+				const request = this.request;
 				const bytes = frame.payload.byteLength;
 				// Return the window once the bytes are handed to the local socket.
-				this.request?.write(frame.payload, () => {
+				request?.write(frame.payload, () => {
 					if (!this.finished) {
-						this.context.send(FrameType.Window, this.id, encodeWindow(bytes));
+						const extra = this.window.delivered(bytes, request.writableLength === 0);
+						this.context.send(FrameType.Window, this.id, encodeWindow(bytes + extra));
 					}
 				});
 				return;
@@ -141,6 +150,7 @@ class HttpStream implements Stream {
 
 	abort(): void {
 		this.finished = true;
+		this.window.release();
 		this.request?.destroy();
 		this.response?.destroy();
 		this.wakeSender?.();
@@ -198,6 +208,7 @@ class HttpStream implements Stream {
 
 	private finish(status: number): void {
 		this.finished = true;
+		this.window.release();
 		this.wakeSender?.();
 		if (!this.requestEnded) {
 			// The local server answered before reading the whole body; the rest will never be sent.

@@ -11,8 +11,8 @@ import {
 	HEARTBEAT_INTERVAL_MS,
 	HEARTBEAT_TIMEOUT_MS,
 	PING,
-	PONG,
 	ProtocolError,
+	WindowBudget,
 } from "@hostc/protocol";
 import { type RawData, WebSocket } from "ws";
 
@@ -23,6 +23,8 @@ export type ConnectionOptions = {
 	tunnel: CreateTunnelResponse;
 	target: URL;
 	onRequest: (entry: RequestLog) => void;
+	/** Heartbeat timing; tests shorten it. */
+	heartbeat?: { intervalMs: number; timeoutMs: number };
 };
 
 export type CloseInfo = { code: number; reason: string };
@@ -33,6 +35,7 @@ export class Connection {
 	private readonly socket: WebSocket;
 	private readonly options: ConnectionOptions;
 	private readonly streams = new Map<number, Stream>();
+	private readonly windowBudget = new WindowBudget();
 	private readonly heartbeat: NodeJS.Timeout;
 	private pongTimeout: NodeJS.Timeout | undefined;
 
@@ -75,10 +78,11 @@ export class Connection {
 		});
 
 		socket.on("message", (data, isBinary) => {
+			// Anything that arrives proves the connection works. The pong can wait behind megabytes of
+			// a wide upload window when the link slows down, and waiting for it alone dropped the tunnel.
+			clearTimeout(this.pongTimeout);
 			if (isBinary) {
 				this.receive(data);
-			} else if (data.toString() === PONG) {
-				clearTimeout(this.pongTimeout);
 			}
 		});
 		socket.on("error", () => {
@@ -94,12 +98,17 @@ export class Connection {
 			resolveClosed({ code, reason: reason.toString() || closeDescription(code) });
 		});
 
-		// A connection that silently died (sleep, network change) never emits close; the missing pong reveals it.
+		// A connection that silently died (sleep, network change) never emits close; when nothing, not
+		// even the pong, arrives after a ping, it is gone.
+		const { intervalMs, timeoutMs } = options.heartbeat ?? {
+			intervalMs: HEARTBEAT_INTERVAL_MS,
+			timeoutMs: HEARTBEAT_TIMEOUT_MS,
+		};
 		this.heartbeat = setInterval(() => {
 			socket.send(PING);
 			clearTimeout(this.pongTimeout);
-			this.pongTimeout = setTimeout(() => socket.terminate(), HEARTBEAT_TIMEOUT_MS);
-		}, HEARTBEAT_INTERVAL_MS);
+			this.pongTimeout = setTimeout(() => socket.terminate(), timeoutMs);
+		}, intervalMs);
 	}
 
 	close(code: number, reason: string): void {
@@ -150,6 +159,7 @@ export class Connection {
 				send: (type, id, payload, flushed) => this.send(type, id, payload, flushed),
 				log: this.options.onRequest,
 				remove: (id) => this.streams.delete(id),
+				windowBudget: this.windowBudget,
 			},
 			frame.stream,
 			decodeOpen(frame.payload),

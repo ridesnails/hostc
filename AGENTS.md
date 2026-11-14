@@ -8,12 +8,12 @@ A tunnel that gives a local HTTP/WebSocket server a public URL. pnpm monorepo, N
 | `packages/client`   | `@hostc/client`    | Node.js client (internal for now; a public SDK will follow)                 |
 | `apps/server`       | `@hostc/server`    | Cloudflare Worker + Durable Object `Tunnel`                                 |
 | `apps/cli`          | `hostc`            | the published CLI, bundled with tsdown                                      |
-| `apps/web`          | `web`              | hostc.dev: one static HTML page and llms.txt                                |
+| `apps/web`          | `web`              | hostc.dev: prerendered pages and llms.txt                                   |
 | `apps/codex-web`    | `@hostc/codex-web` | web client of `hostc codex`, shipped inside the CLI; see its own AGENTS.md  |
 
 `docs/protocol.md` is the specification: change it together with `@hostc/protocol`, and bump
 `PROTOCOL_VERSION` on any incompatible wire change; there is no backward compatibility.
-`docs/release.md` describes deploying and publishing.
+`docs/release.md` describes deploying and publishing, `docs/self-hosting.md` running your own server.
 
 ## How changes ship
 
@@ -21,7 +21,7 @@ hostc is live: `hostc.dev` (site and API) and `*.hostc.app` (tunnels), used ever
 
 - Work on a branch and open a pull request; CI runs on pull requests and on `main`.
 - Merging to `main` deploys to production: Workers Builds redeploys `hostc-tunnel` when
-  `apps/server`, `packages/protocol` or the lockfile change, and `hostc-web` when `apps/web` does.
+  `apps/server`, `packages/protocol` or the lockfile change, and `hostc-web` when `apps/web` or `apps/cli/CHANGELOG.md` does.
 - The CLI ships by hand: bump `version` and `CHANGELOG.md` in `apps/cli`, merge, run "Release CLI"
   with dist-tag `latest`, then create the GitHub release `v<version>`.
 - Users run `npx hostc@latest`; never suggest installing hostc globally or as a dependency.

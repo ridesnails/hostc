@@ -10,17 +10,21 @@ import {
 	encodeClose,
 	encodeText,
 	encodeWindow,
+	type Frame,
 	FrameType,
 	MAX_CHUNK_BYTES,
+	MAX_STREAMS,
 	PING,
 	PONG,
 	STREAM_WINDOW_BYTES,
+	WINDOW_BUDGET_BYTES,
+	type WindowBudget,
 } from "@hostc/protocol";
 import { env, evictDurableObject, runDurableObjectAlarm, runInDurableObject, SELF } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 
 import { tunnelIdFromHost } from "../src/index.ts";
-import { WINDOW_BUDGET_BYTES } from "../src/tunnel.ts";
+import { MAX_WAITING } from "../src/tunnel.ts";
 import { API, connect, createTunnel, PROTOCOL, publicUrl, readAll } from "./helpers.ts";
 
 function createFromSameClient(): Promise<Response> {
@@ -206,35 +210,11 @@ describe("public HTTP", () => {
 		expect(largestGrant).toBeGreaterThan(MAX_CHUNK_BYTES);
 		expect(client.closed).toBeNull();
 
-		const budget = await runInDurableObject(env.TUNNEL.getByName(tunnel.id), (instance) =>
-			Reflect.get(instance, "windowBudget"),
+		const budget = await runInDurableObject(
+			env.TUNNEL.getByName(tunnel.id),
+			(instance) => (Reflect.get(instance, "windowBudget") as WindowBudget).available,
 		);
 		expect(budget).toBe(WINDOW_BUDGET_BYTES);
-	});
-
-	it("stops widening a window once the link, not the window, is the limit", async () => {
-		const tunnel = await createTunnel();
-		const client = await connect(tunnel);
-		const pending = SELF.fetch(publicUrl(tunnel));
-		const open = await client.next((frame) => frame.type === FrameType.Open);
-		client.head(open.stream);
-		const body = readAll(await pending);
-
-		// A link that carries a chunk every 20 ms: a window of 256 KiB takes 80 ms, and a wider one
-		// only takes longer and queues data ahead of other streams.
-		const chunk = new Uint8Array(MAX_CHUNK_BYTES).fill(5);
-		const chunks = 40;
-		for (let index = 0; index < chunks; index += 1) {
-			await new Promise((resolve) => setTimeout(resolve, 20));
-			client.send(FrameType.Data, open.stream, chunk);
-		}
-		const window = await runInDurableObject(env.TUNNEL.getByName(tunnel.id), (instance) => {
-			const streams = Reflect.get(instance, "http") as Map<number, { window: number }>;
-			return streams.get(open.stream)?.window;
-		});
-		client.send(FrameType.End, open.stream);
-		expect((await body).byteLength).toBe(chunks * MAX_CHUNK_BYTES);
-		expect(window).toBeLessThanOrEqual(2 * STREAM_WINDOW_BYTES);
 	});
 
 	it("resets the local request when the visitor goes away", async () => {
@@ -505,6 +485,124 @@ describe("public WebSockets", () => {
 		client.head(open.stream, { body: false });
 		expect((await pending).status).toBe(200);
 	});
+});
+
+/** Fills a tunnel like a dev server page: one public WebSocket (HMR) and requests for every other stream. */
+async function fill() {
+	const tunnel = await createTunnel();
+	const client = await connect(tunnel);
+	const upgrade = SELF.fetch(publicUrl(tunnel, "/hmr"), { headers: { upgrade: "websocket" } });
+	const socketOpen = await client.next((frame) => frame.type === FrameType.Open);
+	client.head(socketOpen.stream, { status: 101, body: false });
+	const socket = (await upgrade).webSocket as WebSocket;
+	socket.accept();
+
+	const requests = Array.from({ length: MAX_STREAMS - 1 }, (_, index) => SELF.fetch(publicUrl(tunnel, `/m/${index}`)));
+	const opens = [];
+	for (let index = 0; index < requests.length; index += 1) {
+		opens.push(await client.next((frame) => frame.type === FrameType.Open, 10_000));
+	}
+	const done = async () => {
+		client.ws.close(1001, "test over");
+		await Promise.allSettled(requests);
+	};
+	return { tunnel, client, socket, requests, opens, done };
+}
+
+const waitingCount = (id: string) =>
+	runInDurableObject(env.TUNNEL.getByName(id), (instance) => (Reflect.get(instance, "waiting") as unknown[]).length);
+
+function spyOnErrors(id: string): { points: unknown[]; ready: Promise<void> } {
+	const points: unknown[] = [];
+	const ready = runInDurableObject(env.TUNNEL.getByName(id), (instance) => {
+		Reflect.set(instance, "env", { ...env, ERRORS: { writeDataPoint: (point: unknown) => points.push(point) } });
+	});
+	return { points, ready };
+}
+
+describe("error counts", () => {
+	it("counts what visitors were refused, by kind only", async () => {
+		const tunnel = await createTunnel();
+		const writes = spyOnErrors(tunnel.id);
+		await writes.ready;
+
+		const offline = await SELF.fetch(publicUrl(tunnel, "/secret?token=abc"));
+		expect(offline.status).toBe(502);
+		await offline.arrayBuffer();
+
+		expect(writes.points).toEqual([{ blobs: ["Tunnel offline"], indexes: ["Tunnel offline"] }]);
+	});
+
+	it("counts a response that fails after it started once", async () => {
+		const tunnel = await createTunnel();
+		const client = await connect(tunnel);
+		const writes = spyOnErrors(tunnel.id);
+		await writes.ready;
+		const pending = SELF.fetch(publicUrl(tunnel));
+		const open = await client.next((frame) => frame.type === FrameType.Open);
+		client.head(open.stream);
+		const response = await pending;
+		const bodyFailed = expect(response.arrayBuffer()).rejects.toThrow("Tunnel offline");
+		client.send(FrameType.Data, open.stream, new Uint8Array(STREAM_WINDOW_BYTES + 1));
+		await bodyFailed;
+
+		expect(writes.points).toEqual([{ blobs: ["Tunnel offline"], indexes: ["Tunnel offline"] }]);
+	});
+});
+
+describe("busy tunnels", () => {
+	it("lets a request wait for a free stream instead of failing", async () => {
+		const { tunnel, client, requests, opens, done } = await fill();
+		const extra = SELF.fetch(publicUrl(tunnel, "/extra"));
+		await expect.poll(() => waitingCount(tunnel.id)).toBe(1);
+		expect(client.frames.some((frame) => frame.type === FrameType.Open)).toBe(false);
+
+		// OPEN frames arrive in whatever order the requests reached the tunnel.
+		const first = opens[0] as Frame;
+		client.head(first.stream, { status: 204, body: false });
+		expect((await requests[Number(decodeOpen(first.payload).path.slice("/m/".length))])?.status).toBe(204);
+		const open = await client.next((frame) => frame.type === FrameType.Open);
+		expect(decodeOpen(open.payload).path).toBe("/extra");
+		client.head(open.stream, { status: 204, body: false });
+		expect((await extra).status).toBe(204);
+		await done();
+	}, 30_000);
+
+	it("lets a request in when a public WebSocket closes", async () => {
+		const { tunnel, client, socket, done } = await fill();
+		const extra = SELF.fetch(publicUrl(tunnel, "/extra"));
+		await expect.poll(() => waitingCount(tunnel.id)).toBe(1);
+
+		socket.close(1000, "page closed");
+		const open = await client.next((frame) => frame.type === FrameType.Open);
+		expect(decodeOpen(open.payload).path).toBe("/extra");
+		client.head(open.stream, { status: 204, body: false });
+		expect((await extra).status).toBe(204);
+		await done();
+	}, 30_000);
+
+	it("stops waiting when the visitor leaves", async () => {
+		const { tunnel, done } = await fill();
+		const visitor = new AbortController();
+		const extra = SELF.fetch(publicUrl(tunnel, "/extra"), { signal: visitor.signal });
+		await expect.poll(() => waitingCount(tunnel.id)).toBe(1);
+		visitor.abort();
+		await expect(extra).rejects.toThrow();
+		await expect.poll(() => waitingCount(tunnel.id)).toBe(0);
+		await done();
+	}, 30_000);
+
+	it("answers 503 once too many requests wait", async () => {
+		const { tunnel, done } = await fill();
+		const waiting = Array.from({ length: MAX_WAITING }, () => SELF.fetch(publicUrl(tunnel, "/extra")));
+		await expect.poll(() => waitingCount(tunnel.id), { timeout: 20_000 }).toBe(MAX_WAITING);
+		const response = await SELF.fetch(publicUrl(tunnel, "/extra"), { headers: { accept: "text/html" } });
+		expect(response.status).toBe(503);
+		expect(await response.text()).toContain("Tunnel busy");
+		await done();
+		const offline = await Promise.all(waiting);
+		expect(offline.every((each) => each.status === 502)).toBe(true);
+	}, 60_000);
 });
 
 describe("connection lifecycle", () => {
