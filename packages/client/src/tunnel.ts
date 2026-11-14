@@ -13,6 +13,10 @@ export type TunnelOptions = {
 	target: string | URL;
 	/** Put in front of the id in the public URL, to say what it opens. */
 	prefix?: TunnelPrefix;
+	/** Fork extension: claim a fixed tunnel name so the public URL never changes. */
+	name?: string;
+	/** Bearer token authorizing the name claim (the server's NAMED_TUNNEL_TOKEN). */
+	adminToken?: string;
 };
 
 export type TunnelEvents = {
@@ -34,6 +38,7 @@ export class Tunnel extends EventEmitter<TunnelEvents> {
 	private readonly server: string;
 	private readonly target: URL;
 	private readonly prefix: TunnelPrefix | undefined;
+	private readonly createOptions?: { name?: string; adminToken?: string };
 	private info: CreateTunnelResponse;
 	private connection: Connection | null = null;
 	private closing = false;
@@ -43,7 +48,11 @@ export class Tunnel extends EventEmitter<TunnelEvents> {
 	private urlChanged = false;
 
 	static async open(options: TunnelOptions): Promise<Tunnel> {
-		const info = await createTunnel(options.server, options.prefix);
+		const info = await createTunnel(options.server, {
+			prefix: options.prefix,
+			name: options.name,
+			adminToken: options.adminToken,
+		});
 		const tunnel = new Tunnel(options, info);
 		tunnel.connection = await tunnel.connect();
 		tunnel.backoff.connected();
@@ -55,6 +64,8 @@ export class Tunnel extends EventEmitter<TunnelEvents> {
 		super();
 		this.server = options.server;
 		this.target = new URL(options.target);
+		this.prefix = options.prefix;
+		this.createOptions = { name: options.name, adminToken: options.adminToken };
 		this.info = info;
 	}
 
@@ -128,8 +139,10 @@ export class Tunnel extends EventEmitter<TunnelEvents> {
 						throw caught;
 					}
 					// The tunnel expired while we were away: start a new one.
-					this.info = await createTunnel(this.server, this.prefix);
-					this.urlChanged = true;
+					// A named tunnel claims the same name again, so its URL is unchanged.
+					const previousUrl = this.info.url;
+					this.info = await createTunnel(this.server, { prefix: this.prefix, ...this.createOptions });
+					this.urlChanged = this.info.url !== previousUrl;
 					this.connection = await this.connect();
 				}
 				if (this.closing) {

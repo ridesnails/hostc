@@ -2,6 +2,8 @@ import {
 	API_TUNNELS_PATH,
 	type CreateTunnelResponse,
 	isTunnelId,
+	isTunnelLabel,
+	isTunnelName,
 	isTunnelPrefix,
 	PROTOCOL_HEADER,
 	PROTOCOL_VERSION,
@@ -56,7 +58,21 @@ export function tunnelIdFromHost(host: string, tunnelDomain: string): string | n
 	if (!normalized.endsWith(suffix)) {
 		return undefined;
 	}
-	return tunnelIdFromLabel(normalized.slice(0, -suffix.length));
+	const label = normalized.slice(0, -suffix.length);
+	// A known prefix (e.g. codex-) names the bare id; a bare label is the id itself.
+	const id = tunnelIdFromLabel(label);
+	if (id !== null) {
+		return id;
+	}
+	// Otherwise the label is a claimed name — unless it ends in `-` + a 12-char
+	// id, which is an unknown prefix in front of a random id (e.g. paypal-<id>)
+	// and must not resolve. A name ending that way is indistinguishable from
+	// that, so it is not treated as a name either.
+	const dash = label.lastIndexOf("-");
+	if (dash > 0 && isTunnelId(label.slice(dash + 1))) {
+		return null;
+	}
+	return isTunnelLabel(label) ? label : null;
 }
 
 function handleTunnelRequest(request: Request, env: Env, tunnelId: string | null): Promise<Response> | Response {
@@ -73,9 +89,33 @@ async function createTunnel(request: Request, env: Env, url: URL): Promise<Respo
 		return jsonError(429, "Too many tunnels created. Try again in a minute.");
 	}
 
-	// An unknown prefix gets a plain address: a newer client still works against this server.
-	const asked = ((await request.json().catch(() => null)) as { prefix?: unknown } | null)?.prefix;
-	const id = randomTunnelId();
+	// The body is read once: it may carry `name` (fork extension: claim a
+	// fixed tunnel name) and/or `prefix` (e.g. codex-).
+	const reqBody = await readCreateBody(request);
+	if (reqBody instanceof Response) {
+		return reqBody;
+	}
+	const { name, prefix: asked } = reqBody;
+
+	// Fork extension: an optional `name` claims a fixed tunnel name.
+	// Random tunnels (no name) stay anonymous; a name is only handed out to a
+	// caller presenting the NAMED_TUNNEL_TOKEN secret, so names cannot be squatted.
+	let id: string;
+	if (name !== undefined) {
+		if (typeof name !== "string") {
+			return jsonError(400, "Tunnel name must be a string.");
+		}
+		if (!isTunnelName(name)) {
+			return jsonError(400, `Invalid tunnel name "${name}". Use 3-32 lowercase letters, digits or hyphens.`);
+		}
+		if (!(await isNamedTunnelAdmin(request, env))) {
+			return jsonError(401, "Claiming a tunnel name requires the named-tunnel token.");
+		}
+		id = name;
+	} else {
+		// An unknown prefix gets a plain address: a newer client still works against this server.
+		id = randomTunnelId();
+	}
 	await env.TUNNEL.getByName(id).init();
 
 	const connectUrl = new URL(`${API_TUNNELS_PATH}/${id}/connect`, url);
@@ -90,7 +130,7 @@ async function createTunnel(request: Request, env: Env, url: URL): Promise<Respo
 }
 
 async function connectTunnel(request: Request, env: Env, id: string): Promise<Response> {
-	if (!isTunnelId(id)) {
+	if (!isTunnelLabel(id)) {
 		return jsonError(404, "Tunnel not found");
 	}
 	if (request.headers.get("upgrade")?.toLowerCase() !== "websocket") {
@@ -108,6 +148,48 @@ function checkProtocol(request: Request): Response | null {
 		return null;
 	}
 	return jsonError(426, "This hostc version is not supported by the server. Run `npx hostc@latest` to upgrade.");
+}
+
+/**
+ * The JSON body of a create request. Returns an empty object for a body-less
+ * (anonymous, random) tunnel, or an error Response when the body is present
+ * but not valid JSON.
+ */
+async function readCreateBody(request: Request): Promise<{ name?: unknown; prefix?: unknown } | Response> {
+	const text = await request.text();
+	if (!text) {
+		return {};
+	}
+	try {
+		return JSON.parse(text) as { name?: unknown; prefix?: unknown };
+	} catch {
+		return jsonError(400, "Create request body must be JSON.");
+	}
+}
+
+/** Named tunnels are authorized by `Authorization: Bearer <NAMED_TUNNEL_TOKEN>`. */
+async function isNamedTunnelAdmin(request: Request, env: Env): Promise<boolean> {
+	const secret = (env as { NAMED_TUNNEL_TOKEN?: string }).NAMED_TUNNEL_TOKEN;
+	if (!secret) {
+		return false;
+	}
+	const token = request.headers.get("authorization")?.match(/^Bearer (\S+)$/)?.[1];
+	if (!token) {
+		return false;
+	}
+	// Compare SHA-256 digests so the comparison time does not leak the secret.
+	const encoder = new TextEncoder();
+	const [given, expected] = await Promise.all([
+		crypto.subtle.digest("SHA-256", encoder.encode(token)),
+		crypto.subtle.digest("SHA-256", encoder.encode(secret)),
+	]);
+	const a = new Uint8Array(given);
+	const b = new Uint8Array(expected);
+	let diff = 0;
+	for (let i = 0; i < a.length; i++) {
+		diff |= (a[i] ?? 0) ^ (b[i] ?? 0);
+	}
+	return diff === 0;
 }
 
 function randomTunnelId(): string {

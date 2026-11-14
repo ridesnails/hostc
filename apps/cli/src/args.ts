@@ -1,7 +1,9 @@
 import { parseArgs } from "node:util";
 
+import { isTunnelName } from "@hostc/protocol";
+
 export type Command =
-	| { kind: "run"; target: URL; server: string; qr: boolean }
+	| { kind: "run"; target: URL; server: string; qr: boolean; name?: string }
 	| { kind: "codex"; server: string; qr: boolean; here: boolean }
 	| { kind: "help" }
 	| { kind: "version" }
@@ -20,6 +22,9 @@ Target:
 
 Options:
   --server <url>   tunnel server (env HOSTC_SERVER)
+  --name <name>    claim a fixed tunnel name, e.g. --name magpie gives
+                   https://magpie.<tunnel-domain> (env HOSTC_NAME);
+                   needs env HOSTC_ADMIN_TOKEN with the server's named-tunnel token
   --qr             print a QR code of the public URL
   --here           hostc codex: show only this directory (commands still reach
                    the whole machine)
@@ -57,10 +62,17 @@ export function parseCommand(argv: string[], env: Record<string, string | undefi
 	}
 	const qr = values.qr ?? false;
 	const here = values.here ?? false;
+	const name = values.name ?? env.HOSTC_NAME;
+	if (name !== undefined && !isTunnelName(name)) {
+		return {
+			kind: "error",
+			message: `Invalid tunnel name "${name}". Use 3-32 lowercase letters, digits or hyphens.`,
+		};
+	}
 	if (target && here) {
 		return { kind: "error", message: "--here only applies to hostc codex." };
 	}
-	return target ? { kind: "run", target, server, qr } : { kind: "codex", server, qr, here };
+	return target ? { kind: "run", target, server, qr, name } : { kind: "codex", server, qr, here };
 }
 
 function parse(argv: string[]) {
@@ -69,6 +81,7 @@ function parse(argv: string[]) {
 		allowPositionals: true,
 		options: {
 			server: { type: "string" },
+			name: { type: "string" },
 			qr: { type: "boolean" },
 			here: { type: "boolean" },
 			help: { type: "boolean", short: "h" },

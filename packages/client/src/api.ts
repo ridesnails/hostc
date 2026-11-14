@@ -30,14 +30,38 @@ export const PROTOCOL_HEADERS = { [PROTOCOL_HEADER]: String(PROTOCOL_VERSION) };
 
 const CREATE_TIMEOUT_MS = 15_000;
 
-export async function createTunnel(server: string, prefix?: TunnelPrefix): Promise<CreateTunnelResponse> {
+export type CreateTunnelOptions = {
+	/** Put in front of the id in the public URL, to say what it opens. */
+	prefix?: TunnelPrefix;
+	/** Fork extension: claim this fixed tunnel name instead of a random id. */
+	name?: string;
+	/** Bearer token authorizing the name claim (the server's NAMED_TUNNEL_TOKEN). */
+	adminToken?: string;
+};
+
+export async function createTunnel(server: string, options?: CreateTunnelOptions): Promise<CreateTunnelResponse> {
 	// The deadline covers both response headers and the complete JSON body.
 	const signal = AbortSignal.timeout(CREATE_TIMEOUT_MS);
+	const headers: Record<string, string> = { ...PROTOCOL_HEADERS };
+	const createBody: Record<string, unknown> = {};
+	if (options?.name) {
+		createBody.name = options.name;
+		if (options.adminToken) {
+			headers.authorization = `Bearer ${options.adminToken}`;
+		}
+	}
+	if (options?.prefix) {
+		createBody.prefix = options.prefix;
+	}
+	const requestBody = Object.keys(createBody).length > 0 ? JSON.stringify(createBody) : undefined;
+	if (requestBody) {
+		headers["content-type"] = "application/json";
+	}
 	try {
 		const response = await fetch(new URL(API_TUNNELS_PATH, server), {
 			method: "POST",
-			headers: PROTOCOL_HEADERS,
-			...(prefix ? { body: JSON.stringify({ prefix }) } : {}),
+			headers,
+			body: requestBody,
 			signal,
 		});
 		if (response.status !== 201) {

@@ -15,6 +15,8 @@ import {
 	encodeWindow,
 	FrameType,
 	isTunnelId,
+	isTunnelLabel,
+	isTunnelName,
 	parseSubprotocols,
 	responseHasBody,
 	ProtocolError,
@@ -139,5 +141,20 @@ describe("helpers", () => {
 		expect(isTunnelId("abcdefghijk2")).toBe(true);
 		expect(isTunnelId("abcdefghijk1")).toBe(false);
 		expect(isTunnelId("abc")).toBe(false);
+	});
+
+	it("validates tunnel names (fork extension)", () => {
+		expect(isTunnelName("magpie")).toBe(true);
+		expect(isTunnelName("my-tunnel-1")).toBe(true);
+		// A valid random id is never a name, so the two never collide.
+		expect(isTunnelName("abcdefghijk2")).toBe(false);
+		expect(isTunnelName("ab")).toBe(false);
+		expect(isTunnelName("-magpie")).toBe(false);
+		expect(isTunnelName("magpie-")).toBe(false);
+		expect(isTunnelName("Magpie")).toBe(false);
+		expect(isTunnelName("mag_pie")).toBe(false);
+		expect(isTunnelLabel("abcdefghijk2")).toBe(true);
+		expect(isTunnelLabel("magpie")).toBe(true);
+		expect(isTunnelLabel("nope!")).toBe(false);
 	});
 });

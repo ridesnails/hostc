@@ -28,6 +28,7 @@ async function main(): Promise<number> {
 	const { server, qr } = command;
 	let codex: CodexSession | undefined;
 	let target: URL;
+	let name: string | undefined;
 	if (command.kind === "codex") {
 		try {
 			codex = await startCodex(__HOSTC_VERSION__, command.here);
@@ -38,6 +39,7 @@ async function main(): Promise<number> {
 		target = codex.target;
 	} else {
 		target = command.target;
+		name = command.name;
 		if (!(await isListening(target))) {
 			console.log(
 				styleText("yellow", `Nothing is listening on ${target.host} yet; requests will fail until it starts.`),
@@ -50,7 +52,11 @@ async function main(): Promise<number> {
 
 	let tunnel: Tunnel;
 	try {
-		tunnel = await Tunnel.open({ server, target, ...(codex ? { prefix: "codex" as const } : {}) });
+		tunnel = await Tunnel.open({
+			server,
+			target,
+			...(codex ? { prefix: "codex" as const } : { name, adminToken: process.env.HOSTC_ADMIN_TOKEN }),
+		});
 	} catch (error) {
 		codex?.stop();
 		console.error(`${styleText("red", "error")} ${describe(error)}`);
